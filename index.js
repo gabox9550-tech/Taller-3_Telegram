@@ -203,11 +203,91 @@ const MIME_VIDEOS = {
   '.m4v': 'video/x-m4v',
 };
 const LIMITE_VIDEO_API_BYTES = 50 * 1024 * 1024; // 50 MB (límite de Telegram Bot API)
+const INTERVALO_PROGRESO_TELEGRAM_MS = 2500;
+const INTERVALO_PROGRESO_TERMINAL_MS = 250;
+
+function barraProgreso(porcentaje, largo = 12) {
+  const pct = Math.min(100, Math.max(0, Number(porcentaje) || 0));
+  const llenos = Math.round((pct / 100) * largo);
+  return '█'.repeat(llenos) + '░'.repeat(Math.max(0, largo - llenos));
+}
+
+function formatearVelocidad(bytesPorSeg) {
+  if (!Number.isFinite(bytesPorSeg) || bytesPorSeg <= 0) return 'calculando...';
+  const mbPorSeg = bytesPorSeg / (1024 * 1024);
+  if (mbPorSeg >= 1) return `${mbPorSeg.toFixed(2)} MB/s`;
+  const kbPorSeg = bytesPorSeg / 1024;
+  return `${Math.max(1, Math.round(kbPorSeg))} KB/s`;
+}
+
+function formatearDuracion(segundos) {
+  if (!Number.isFinite(segundos) || segundos < 0) return '--';
+  const total = Math.round(segundos);
+  if (total < 60) return `${total}s`;
+  const min = Math.floor(total / 60);
+  const seg = total % 60;
+  return `${min}m ${String(seg).padStart(2, '0')}s`;
+}
 
 /**
- * Envía un video en streaming usando axios para soportar archivos grandes sin saturar la RAM.
+ * Coordina las ediciones del mensaje de progreso en Telegram sin saturar la API
+ * ni dejar ediciones en vuelo que pisen el mensaje final.
  */
-async function enviarVideoResistente(ctx, rutaVideo, nombreArchivo, caption = '') {
+function crearControladorEstadoTelegram(ctx, textoInicial = '') {
+  let ultimoTexto = textoInicial;
+  let ultimoEditMs = textoInicial ? Date.now() : 0;
+  let enCurso = false;
+  let textoPendiente = null;
+  let promesaActual = Promise.resolve();
+
+  function lanzarEdicion(texto) {
+    if (!ctx || typeof ctx.editMessageText !== 'function') return;
+    if (texto === ultimoTexto) return;
+
+    if (enCurso) {
+      textoPendiente = texto;
+      return;
+    }
+
+    enCurso = true;
+    ultimoTexto = texto;
+    ultimoEditMs = Date.now();
+
+    promesaActual = Promise.resolve(ctx.editMessageText(texto))
+      .catch(() => {
+        // Ignorar errores transitorios ("message is not modified", 429 o mensaje borrado).
+      })
+      .finally(() => {
+        enCurso = false;
+        if (textoPendiente && textoPendiente !== ultimoTexto) {
+          const siguiente = textoPendiente;
+          textoPendiente = null;
+          lanzarEdicion(siguiente);
+        } else {
+          textoPendiente = null;
+        }
+      });
+  }
+
+  return {
+    actualizar(texto, forzar = false) {
+      if (!texto || texto === ultimoTexto) return;
+      const ahora = Date.now();
+      if (!forzar && ahora - ultimoEditMs < INTERVALO_PROGRESO_TELEGRAM_MS) return;
+      lanzarEdicion(texto);
+    },
+    async esperarPendientes() {
+      textoPendiente = null;
+      await promesaActual;
+    },
+  };
+}
+
+/**
+ * Envía un video en streaming usando axios mostrando progreso en vivo en terminal y Telegram.
+ */
+async function enviarVideoResistente(ctx, rutaVideo, nombreArchivo, caption = '', opciones = {}) {
+  const { etiquetaLote = '', controlEstado = null } = opciones;
   const stats = fs.statSync(rutaVideo);
   if (stats.size > LIMITE_VIDEO_API_BYTES) {
     const mb = (stats.size / (1024 * 1024)).toFixed(1);
@@ -221,42 +301,167 @@ async function enviarVideoResistente(ctx, rutaVideo, nombreArchivo, caption = ''
   const url = `https://api.telegram.org/bot${TOKEN}/sendVideo`;
   const ext = path.extname(nombreArchivo).toLowerCase();
   const contentType = MIME_VIDEOS[ext] || 'video/mp4';
+  const totalArchivoMb = (stats.size / (1024 * 1024)).toFixed(1);
 
-  for (let intento = 1; intento <= 3; intento++) {
-    try {
-      const form = new FormData();
-      form.append('chat_id', String(ctx.chat.id));
-      if (caption) {
-        form.append('caption', caption);
-      }
-      form.append('supports_streaming', 'true');
-      form.append('video', fs.createReadStream(rutaVideo), {
-        filename: nombreArchivo,
-        contentType,
-      });
-
-      await axios.post(url, form, {
-        headers: form.getHeaders(),
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        timeout: 300000,
-      });
-
-      return true;
-    } catch (err) {
-      const status = err.response?.status;
-      const detalle = sinToken(err.response ? JSON.stringify(err.response.data) : err.message);
-      console.error(`[AVISO] Error al enviar el video (intento ${intento}/3): ${detalle}`);
-      if (status === 413) {
-        await responder(ctx, `⚠️ Telegram rechazó "${nombreArchivo}" por superar el límite máximo permitido (50 MB).`);
-        return false;
-      }
-      if (intento < 3) await new Promise((r) => setTimeout(r, 2500));
+  const enviarAccionSubida = () => {
+    if (ctx && typeof ctx.sendChatAction === 'function') {
+      Promise.resolve(ctx.sendChatAction('upload_video')).catch(() => {});
     }
-  }
+  };
+  enviarAccionSubida();
+  const intervaloAccion = setInterval(enviarAccionSubida, 4500);
 
-  await responder(ctx, `⚠️ No se pudo enviar el video "${nombreArchivo}" después de varios intentos.`);
-  return false;
+  try {
+    for (let intento = 1; intento <= 3; intento++) {
+      const inicioIntentoMs = Date.now();
+      let ultimoPrintTerminalMs = 0;
+      let ultimoPasoNoTTY = -1;
+      let enLineaTTY = false;
+      let avisoProcesandoImpreso = false;
+      let avisoProcesandoTelegram = false;
+
+      const cerrarLineaTTY = () => {
+        if (enLineaTTY) {
+          process.stdout.write('\n');
+          enLineaTTY = false;
+        }
+      };
+
+      console.log(
+        `[video] Subiendo ${etiquetaLote}"${nombreArchivo}" (${totalArchivoMb} MB) [intento ${intento}/3]...`
+      );
+      if (controlEstado) {
+        controlEstado.actualizar(
+          `⏳ Enviando ${etiquetaLote}${nombreArchivo} (${totalArchivoMb} MB)\n` +
+          `[${barraProgreso(0, 12)}] 0% • Iniciando subida (intento ${intento}/3)...`,
+          intento > 1
+        );
+      }
+
+      try {
+        const form = new FormData();
+        form.append('chat_id', String(ctx.chat.id));
+        if (caption) {
+          form.append('caption', caption);
+        }
+        form.append('supports_streaming', 'true');
+        form.append('video', fs.createReadStream(rutaVideo), {
+          filename: nombreArchivo,
+          contentType,
+        });
+
+        await axios.post(url, form, {
+          headers: form.getHeaders(),
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          timeout: 300000,
+          onUploadProgress: (ev) => {
+            const totalBytes = ev.total || stats.size || 1;
+            const loadedBytes = Math.min(ev.loaded || 0, totalBytes);
+            const porcentaje = Math.min(100, Math.max(0, Math.round((loadedBytes / totalBytes) * 100)));
+            const cargadoMb = (loadedBytes / (1024 * 1024)).toFixed(1);
+            const totalMb = (totalBytes / (1024 * 1024)).toFixed(1);
+            const transcurridoSeg = (Date.now() - inicioIntentoMs) / 1000;
+            const velBps = ev.rate || (transcurridoSeg >= 0.5 ? loadedBytes / transcurridoSeg : 0);
+            const etaSeg = Number.isFinite(ev.estimated)
+              ? ev.estimated
+              : (velBps > 0 ? Math.max(0, (totalBytes - loadedBytes) / velBps) : null);
+
+            if (porcentaje >= 100) {
+              if (!avisoProcesandoImpreso) {
+                avisoProcesandoImpreso = true;
+                const linea100 =
+                  `[video] [${barraProgreso(100, 20)}] 100% | ${totalMb}/${totalMb} MB | ` +
+                  `Subido en ${formatearDuracion(transcurridoSeg)}`;
+                if (process.stdout.isTTY) {
+                  process.stdout.write(`\r${linea100}      \n`);
+                  enLineaTTY = false;
+                } else {
+                  console.log(linea100);
+                }
+                console.log(
+                  `[video] Subida al 100% para "${nombreArchivo}". Esperando confirmación de Telegram...`
+                );
+              }
+              if (controlEstado && !avisoProcesandoTelegram) {
+                avisoProcesandoTelegram = true;
+                controlEstado.actualizar(
+                  `⏳ Procesando en Telegram ${etiquetaLote}${nombreArchivo} (${totalArchivoMb} MB)\n` +
+                  `[${barraProgreso(100, 12)}] 100% • Subida completa, esperando confirmación...`,
+                  true
+                );
+              }
+              return;
+            }
+
+            const ahora = Date.now();
+            const barraTerm = barraProgreso(porcentaje, 20);
+            const resumenVel = `${formatearVelocidad(velBps)} | ETA ${formatearDuracion(etaSeg)}`;
+
+            if (process.stdout.isTTY) {
+              if (ahora - ultimoPrintTerminalMs >= INTERVALO_PROGRESO_TERMINAL_MS) {
+                ultimoPrintTerminalMs = ahora;
+                process.stdout.write(
+                  `\r[video] [${barraTerm}] ${String(porcentaje).padStart(3)}% | ${cargadoMb}/${totalMb} MB | ${resumenVel}   `
+                );
+                enLineaTTY = true;
+              }
+            } else {
+              const paso = Math.floor(porcentaje / 10) * 10;
+              if (paso > ultimoPasoNoTTY) {
+                ultimoPasoNoTTY = paso;
+                console.log(
+                  `[video] [${barraTerm}] ${String(porcentaje).padStart(3)}% | ${cargadoMb}/${totalMb} MB | ${resumenVel}`
+                );
+              }
+            }
+
+            if (controlEstado) {
+              controlEstado.actualizar(
+                `⏳ Enviando ${etiquetaLote}${nombreArchivo} (${totalArchivoMb} MB)\n` +
+                `[${barraProgreso(porcentaje, 12)}] ${porcentaje}% • ${cargadoMb}/${totalMb} MB\n` +
+                `🚀 ${formatearVelocidad(velBps)} • ⏱️ ETA ${formatearDuracion(etaSeg)} (intento ${intento}/3)`
+              );
+            }
+          },
+        });
+
+        cerrarLineaTTY();
+        const duracionTotalSeg = (Date.now() - inicioIntentoMs) / 1000;
+        console.log(`[video] ✅ "${nombreArchivo}" enviado en ${formatearDuracion(duracionTotalSeg)}.`);
+        if (controlEstado) await controlEstado.esperarPendientes();
+        return true;
+      } catch (err) {
+        cerrarLineaTTY();
+        const status = err.response?.status;
+        const detalle = sinToken(err.response ? JSON.stringify(err.response.data) : err.message);
+        console.error(`[AVISO] Error al enviar el video (intento ${intento}/3): ${detalle}`);
+        if (status === 413) {
+          if (controlEstado) await controlEstado.esperarPendientes();
+          await responder(
+            ctx,
+            `⚠️ Telegram rechazó "${nombreArchivo}" por superar el límite máximo permitido (50 MB).`
+          );
+          return false;
+        }
+        if (intento < 3) {
+          if (controlEstado) {
+            controlEstado.actualizar(
+              `⏳ Error temporal al enviar ${etiquetaLote}${nombreArchivo} (intento ${intento}/3). Reintentando en 2.5s...`,
+              true
+            );
+          }
+          await new Promise((r) => setTimeout(r, 2500));
+        }
+      }
+    }
+
+    if (controlEstado) await controlEstado.esperarPendientes();
+    await responder(ctx, `⚠️ No se pudo enviar el video "${nombreArchivo}" después de varios intentos.`);
+    return false;
+  } finally {
+    clearInterval(intervaloAccion);
+  }
 }
 
 // --- 3. Comandos basicos ----------------------------------------------------
@@ -630,9 +835,12 @@ function construirTecladoVideos(videos, seleccionados = null) {
   return Markup.inlineKeyboard(filas);
 }
 
-async function enviarLoteVideos(ctx, listaVideos) {
+async function enviarLoteVideos(ctx, listaVideos, controlEstado = null) {
   let enviados = 0;
-  for (const video of listaVideos) {
+  const total = listaVideos.length;
+  for (let i = 0; i < total; i++) {
+    const video = listaVideos[i];
+    const etiquetaLote = total > 1 ? `(${i + 1}/${total}) ` : '';
     if (!fs.existsSync(video.ruta)) {
       await responder(ctx, `⚠️ El video "${video.archivo}" ya no se encuentra en datos/paraEnviar/Videos/.`);
       continue;
@@ -641,7 +849,8 @@ async function enviarLoteVideos(ctx, listaVideos) {
       ctx,
       video.ruta,
       video.archivo,
-      `🎬 Video solicitado: ${video.archivo} (${video.mb} MB)`
+      `🎬 Video solicitado: ${video.archivo} (${video.mb} MB)`,
+      { etiquetaLote, controlEstado }
     );
     if (ok) enviados += 1;
   }
@@ -675,8 +884,12 @@ bot.action(/^vid:(one|tog):([0-9a-f]{12})$/, async (ctx) => {
 
   if (modo === 'one') {
     await ctx.answerCbQuery('Enviando video...');
-    await ctx.editMessageText(`⏳ Enviando video: ${video.archivo} (${video.mb} MB)...`);
-    const ok = await enviarLoteVideos(ctx, [video]);
+    const textoInicio =
+      `⏳ Enviando ${video.archivo} (${video.mb} MB)\n` +
+      `[${barraProgreso(0, 12)}] 0% • Iniciando subida (intento 1/3)...`;
+    await ctx.editMessageText(textoInicio);
+    const controlEstado = crearControladorEstadoTelegram(ctx, textoInicio);
+    const ok = await enviarLoteVideos(ctx, [video], controlEstado);
     if (ok > 0) {
       await ctx.editMessageText(`✅ Video enviado: ${video.archivo}`);
     } else {
@@ -732,8 +945,10 @@ bot.action('vid:send', async (ctx) => {
   }
 
   await ctx.answerCbQuery(`Enviando ${elegidos.length} video(s)...`);
-  await ctx.editMessageText(`⏳ Enviando ${elegidos.length} video(s) seleccionado(s)...`);
-  const enviados = await enviarLoteVideos(ctx, elegidos);
+  const textoInicio = `⏳ Preparando envío de ${elegidos.length} video(s) seleccionado(s)...`;
+  await ctx.editMessageText(textoInicio);
+  const controlEstado = crearControladorEstadoTelegram(ctx, textoInicio);
+  const enviados = await enviarLoteVideos(ctx, elegidos, controlEstado);
   await ctx.editMessageText(`✅ Envío finalizado: ${enviados} de ${elegidos.length} video(s) enviado(s).`);
 });
 
@@ -744,8 +959,10 @@ bot.action('vid:all', async (ctx) => {
   }
 
   await ctx.answerCbQuery(`Enviando ${videos.length} video(s)...`);
-  await ctx.editMessageText(`⏳ Enviando todos los videos (${videos.length})...`);
-  const enviados = await enviarLoteVideos(ctx, videos);
+  const textoInicio = `⏳ Preparando envío de todos los videos (${videos.length})...`;
+  await ctx.editMessageText(textoInicio);
+  const controlEstado = crearControladorEstadoTelegram(ctx, textoInicio);
+  const enviados = await enviarLoteVideos(ctx, videos, controlEstado);
   await ctx.editMessageText(`✅ Envío finalizado: ${enviados} de ${videos.length} video(s) enviado(s).`);
 });
 
