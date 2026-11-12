@@ -236,14 +236,16 @@ async function ejecutarIA(ctx, prompt, forzarGrafica = false) {
       try {
         await proc.generarGrafica(rutaTempPng, rutaTempJson);
         const buffer = fs.readFileSync(rutaTempPng);
-        const caption = resultado.mensaje || '📊 Gráfica generada con datos en tiempo real';
+        const tituloGrafica = resultado.datos_grafica.titulo || 'Gráfica estadística generada con datos en tiempo real';
 
-        if (caption.length <= 1000) {
-          await enviarMediaResistente(ctx, buffer, 'grafica.png', caption);
-        } else {
-          await enviarMediaResistente(ctx, buffer, 'grafica.png', '');
-          for (let i = 0; i < caption.length; i += 4000) {
-            await ctx.reply(caption.slice(i, i + 4000));
+        // 1. Enviamos la imagen con un caption conciso y limpio
+        await enviarMediaResistente(ctx, buffer, 'grafica.png', `📊 ${tituloGrafica}`);
+
+        // 2. Enviamos el análisis completo en mensaje(s) de texto independiente para evitar recortes en Telegram
+        const textoAnalisis = (resultado.mensaje || '').trim();
+        if (textoAnalisis) {
+          for (let i = 0; i < textoAnalisis.length; i += 4000) {
+            await ctx.reply(textoAnalisis.slice(i, i + 4000));
           }
         }
       } finally {
