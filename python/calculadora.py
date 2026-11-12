@@ -5,6 +5,7 @@
 #  El bot la invoca asi desde Node:
 #      python calculadora.py sumar 2 3
 #      python calculadora.py multiplicar 4 2.5
+#      python calculadora.py fibonacci 10
 #
 #  Un script .py NO se ejecuta solo: necesita que alguien lo llame
 #  (python script.py). Ese "alguien" es Node, que hereda los permisos
@@ -22,12 +23,44 @@ def multiplicar(a, b):
     return a * b
 
 
+def fibonacci(n):
+    if n < 0:
+        raise ValueError("n debe ser un entero no negativo")
+    if n == 0:
+        return 0
+    a, b = 0, 1
+    for _ in range(n - 1):
+        a, b = b, a + b
+    return b
+
+
 def main(argv):
+    if len(argv) < 3:
+        print("uso: calculadora.py <sumar|multiplicar> <a> <b> o calculadora.py fibonacci <n>")
+        return 2
+
+    operacion = argv[1].lower()
+
+    if operacion == "fibonacci":
+        try:
+            n = int(argv[2])
+            if n < 0:
+                print("el valor de n debe ser mayor o igual a 0")
+                return 2
+            if n > 1000:
+                print("el valor de n debe ser menor o igual a 1000")
+                return 2
+        except ValueError:
+            print("el operando debe ser un numero entero")
+            return 2
+
+        print("Fibonacci(%d) = %d" % (n, fibonacci(n)))
+        return 0
+
     if len(argv) < 4:
         print("uso: calculadora.py <sumar|multiplicar> <a> <b>")
         return 2
 
-    operacion = argv[1].lower()
     try:
         a = float(argv[2])
         b = float(argv[3])

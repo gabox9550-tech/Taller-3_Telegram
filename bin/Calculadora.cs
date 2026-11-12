@@ -76,6 +76,41 @@ class Calculadora
             return 0;
         }
 
+        // --- "fibonacci" ---------------------------------------------------
+        if (operacion == "fibonacci")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("Falta el valor de n. Ejemplo: calculadora.exe fibonacci 10");
+                return 2;
+            }
+
+            int n;
+            if (!int.TryParse(args[1], out n) || n < 0)
+            {
+                Console.Error.WriteLine("El valor de n debe ser un entero no negativo.");
+                return 2;
+            }
+
+            long a = 0;
+            long b = 1;
+            if (n == 0)
+            {
+                Console.WriteLine("Fibonacci(0) = 0");
+                return 0;
+            }
+
+            for (int i = 0; i < n - 1; i++)
+            {
+                long temp = a + b;
+                a = b;
+                b = temp;
+            }
+
+            Console.WriteLine("Fibonacci(" + n + ") = " + b);
+            return 0;
+        }
+
         Console.Error.WriteLine("Operacion no reconocida: " + operacion);
         return 2;
     }

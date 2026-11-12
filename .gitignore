@@ -3,6 +3,11 @@ node_modules/
 
 # Secretos (el token del bot no se comparte)
 .env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
 
 # Archivos que genera el taller
 datos/descargas/*

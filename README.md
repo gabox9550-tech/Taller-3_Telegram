@@ -18,6 +18,9 @@ Requisitos: Node.js 18 o mayor, Python 3 y Windows para `calculadora.exe`
 | Comando | Que hace |
 |---|---|
 | `/sumar 2 3`, `/multiplicar 4 2.5` | Operan con `python/calculadora.py` |
+| `/fibonacci 10` | Calcula el n-ésimo número de Fibonacci con Python |
+| `/graficar sin(x)` | Genera gráficas con `python/graficador.py` (Matplotlib) |
+| `/sistema` o `/stats` | Monitor de CPU, RAM, disco y uptime con botón de refresco |
 | `/exe sumar 7 5` | Invoca `bin/calculadora.exe` |
 | `/calcular 7 5` | Muestra botones: operacion y motor (Python o .exe) |
 | `/pdf`, `/imagen`, `/video` | Envian los archivos de `datos/paraEnviar/` (con botones para elegir) |

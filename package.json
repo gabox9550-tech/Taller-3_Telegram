@@ -5,7 +5,7 @@
   "main": "index.js",
   "private": true,
   "scripts": {
-    "start": "node index.js",
+    "start": "node --dns-result-order=ipv4first index.js",
     "start:permisos": "node --permission --allow-fs-read=./* --allow-fs-write=./datos/* --allow-child-process index.js"
   },
   "dependencies": {

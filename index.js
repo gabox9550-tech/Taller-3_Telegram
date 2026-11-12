@@ -1,5 +1,8 @@
 'use strict';
- 
+
+const dns = require('node:dns');
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
+
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -73,6 +76,9 @@ const AYUDA =
   'Comandos del taller:\n\n' +
   '/sumar 2 3            suma usando Python\n' +
   '/multiplicar 4 2.5    multiplica usando Python\n' +
+  '/fibonacci 10         calcula el n-ésimo número de Fibonacci\n' +
+  '/graficar sin(x)      genera y envía una gráfica con Python y botones\n' +
+  '/sistema              monitor de recursos del sistema en tiempo real\n' +
   '/exe sumar 7 5        invoca calculadora.exe directamente\n' +
   '/calcular 7 5         te muestra botones para elegir\n' +
   '/id                   muestra tu id de Telegram\n' +
@@ -166,7 +172,7 @@ async function enviarFotoResistente(ctx, buffer, nombreArchivo, caption = '') {
       
       form.append('photo', buffer, {
         filename: nombreArchivo,
-        contentType: 'image/jpeg', 
+        contentType: nombreArchivo.endsWith('.png') ? 'image/png' : 'image/jpeg', 
       });
 
       await axios.post(url, form, {
@@ -273,6 +279,130 @@ for (const operacion of ['sumar', 'multiplicar']) {
     }
   });
 }
+
+// /fibonacci calcula el n-ésimo número de Fibonacci mediante Python
+bot.command('fibonacci', async (ctx) => {
+  const arg = String(ctx.payload || '').trim();
+  if (!arg) {
+    return responder(ctx, 'Uso: /fibonacci <n>\nEjemplo: /fibonacci 10');
+  }
+
+  const n = Number(arg);
+  if (!Number.isInteger(n) || n < 0) {
+    return responder(ctx, 'El número n debe ser un entero no negativo (>= 0).\nEjemplo: /fibonacci 10');
+  }
+
+  if (n > 1000) {
+    return responder(ctx, 'Por favor especifica un valor de n menor o igual a 1000.');
+  }
+
+  try {
+    const { stdout } = await proc.ejecutarFibonacci(n);
+    await responder(ctx, '🔢 ' + stdout);
+  } catch (e) {
+    await responder(ctx, textoError(e));
+  }
+});
+
+// Función auxiliar para generar y despachar gráficas
+async function procesarYEnviarGrafica(ctx, expresion, parametro) {
+  try {
+    const { stdout } = await proc.generarGrafica(expresion, parametro);
+    if (!fs.existsSync(proc.RUTA_GRAFICA)) {
+      return responder(ctx, '⚠️ No se pudo generar la imagen de la gráfica.');
+    }
+
+    const buffer = fs.readFileSync(proc.RUTA_GRAFICA);
+    const caption = expresion.toLowerCase() === 'fibonacci'
+      ? `📈 Gráfica de los primeros ${parametro || 15} términos de Fibonacci`
+      : `📈 Gráfica de f(x) = ${expresion}`;
+
+    await enviarFotoResistente(ctx, buffer, 'grafica.png', caption);
+  } catch (e) {
+    await responder(ctx, textoError(e));
+  }
+}
+
+// Botones rápidos para funciones matemáticas
+function tecladoGraficas() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📈 Parábola (x²)', 'graf:x^2'),
+     Markup.button.callback('〰️ Seno: sin(x)', 'graf:sin(x)')],
+    [Markup.button.callback('🌊 Coseno: cos(x)', 'graf:cos(x)'),
+     Markup.button.callback('🌀 Fibonacci: 15', 'graf:fibonacci:15')],
+    [Markup.button.callback('📉 Cúbica: x³ - 3x', 'graf:x^3 - 3*x')]
+  ]);
+}
+
+// /graficar invoca Python + Matplotlib para generar gráficas
+bot.command('graficar', async (ctx) => {
+  const payload = String(ctx.payload || '').trim();
+
+  if (!payload) {
+    return ctx.reply(
+      '📊 *Generador de Gráficas Matemáticas (Python + Matplotlib)*\n\n' +
+      'Elige una función rápida con los botones o escribe tu propia función:\n' +
+      '• `/graficar x^2`\n' +
+      '• `/graficar sin(x)`\n' +
+      '• `/graficar x^3 - 3*x`\n' +
+      '• `/graficar fibonacci 20`',
+      { parse_mode: 'Markdown', ...tecladoGraficas() }
+    );
+  }
+
+  const partes = payload.split(/\s+/);
+  if (partes[0].toLowerCase() === 'fibonacci') {
+    const n = partes[1] ? Number(partes[1]) : 15;
+    if (!Number.isInteger(n) || n < 2 || n > 50) {
+      return responder(ctx, 'Para graficar Fibonacci, especifica un número n entre 2 y 50.\nEjemplo: /graficar fibonacci 20');
+    }
+    return procesarYEnviarGrafica(ctx, 'fibonacci', n);
+  }
+
+  return procesarYEnviarGrafica(ctx, payload);
+});
+
+// Atiende los clics de los botones de gráficas
+bot.action(/^graf:(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Generando gráfica...');
+  const datos = ctx.match[1].split(':');
+  const expr = datos[0];
+  const param = datos[1] || null;
+  return procesarYEnviarGrafica(ctx, expr, param);
+});
+
+// --- Monitor de Recursos del Sistema (psutil + callback queries) -------------
+
+function tecladoSistema() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔄 Actualizar en tiempo real', 'refrescar_sistema')]
+  ]);
+}
+
+bot.command(['sistema', 'stats'], async (ctx) => {
+  try {
+    const { stdout } = await proc.obtenerSistema();
+    await ctx.reply(stdout, { parse_mode: 'Markdown', ...tecladoSistema() });
+  } catch (e) {
+    await responder(ctx, textoError(e));
+  }
+});
+
+// Atiende el clic en "Actualizar en tiempo real" editando el mensaje
+bot.action('refrescar_sistema', async (ctx) => {
+  try {
+    const { stdout } = await proc.obtenerSistema();
+    await ctx.answerCbQuery('Métricas actualizadas ⚡');
+    await ctx.editMessageText(stdout, { parse_mode: 'Markdown', ...tecladoSistema() });
+  } catch (e) {
+    if (e.message && e.message.includes('message is not modified')) {
+      await ctx.answerCbQuery('Sin cambios recientes');
+    } else {
+      await ctx.answerCbQuery('Error al actualizar');
+      console.error('Error al refrescar sistema:', sinToken(e.message));
+    }
+  }
+});
 
 // /exe invoca el binario de consola directamente.
 bot.command('exe', async (ctx) => {
