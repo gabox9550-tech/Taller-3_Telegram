@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -76,7 +77,8 @@ const AYUDA =
   '/calcular 7 5         te muestra botones para elegir\n' +
   '/id                   muestra tu id de Telegram\n' +
   '/pdf                  envia el PDF de ejemplo\n' +
-  '/imagen               muestra 3 botones para elegir una imagen\n\n' +
+  '/imagen               muestra 3 botones para elegir una imagen\n' +
+  '/video                muestra los videos disponibles para elegir\n\n' +
   'Tambien puedes enviarme un documento o una foto.';
 
 /** Responde sin romper el bot si algo falla. */
@@ -183,6 +185,71 @@ async function enviarFotoResistente(ctx, buffer, nombreArchivo, caption = '') {
   }
 
   await responder(ctx, '⚠️ No se pudo enviar la imagen después de varios intentos.');
+  return false;
+}
+
+const MIME_VIDEOS = {
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.mkv': 'video/x-matroska',
+  '.avi': 'video/x-msvideo',
+  '.webm': 'video/webm',
+  '.m4v': 'video/x-m4v',
+};
+const LIMITE_VIDEO_API_BYTES = 50 * 1024 * 1024; // 50 MB (límite de Telegram Bot API)
+
+/**
+ * Envía un video en streaming usando axios para soportar archivos grandes sin saturar la RAM.
+ */
+async function enviarVideoResistente(ctx, rutaVideo, nombreArchivo, caption = '') {
+  const stats = fs.statSync(rutaVideo);
+  if (stats.size > LIMITE_VIDEO_API_BYTES) {
+    const mb = (stats.size / (1024 * 1024)).toFixed(1);
+    await responder(
+      ctx,
+      `⚠️ El video "${nombreArchivo}" pesa ${mb} MB y supera el límite de 50 MB de la API estándar de Telegram Bots para envío directo.`
+    );
+    return false;
+  }
+
+  const url = `https://api.telegram.org/bot${TOKEN}/sendVideo`;
+  const ext = path.extname(nombreArchivo).toLowerCase();
+  const contentType = MIME_VIDEOS[ext] || 'video/mp4';
+
+  for (let intento = 1; intento <= 3; intento++) {
+    try {
+      const form = new FormData();
+      form.append('chat_id', String(ctx.chat.id));
+      if (caption) {
+        form.append('caption', caption);
+      }
+      form.append('supports_streaming', 'true');
+      form.append('video', fs.createReadStream(rutaVideo), {
+        filename: nombreArchivo,
+        contentType,
+      });
+
+      await axios.post(url, form, {
+        headers: form.getHeaders(),
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: 300000,
+      });
+
+      return true;
+    } catch (err) {
+      const status = err.response?.status;
+      const detalle = sinToken(err.response ? JSON.stringify(err.response.data) : err.message);
+      console.error(`[AVISO] Error al enviar el video (intento ${intento}/3): ${detalle}`);
+      if (status === 413) {
+        await responder(ctx, `⚠️ Telegram rechazó "${nombreArchivo}" por superar el límite máximo permitido (50 MB).`);
+        return false;
+      }
+      if (intento < 3) await new Promise((r) => setTimeout(r, 2500));
+    }
+  }
+
+  await responder(ctx, `⚠️ No se pudo enviar el video "${nombreArchivo}" después de varios intentos.`);
   return false;
 }
 
@@ -295,10 +362,13 @@ bot.action(/^calc:(sumar|multiplicar):(py|exe):([^:]+):([^:]+)$/, async (ctx) =>
 // --- Enviar archivos locales ---
 
 bot.command('pdf', async (ctx) => {
-  const rutaPdf = path.join(__dirname, 'datos', 'paraEnviar', 'ejemplo.pdf');
-  
+  const rutaPdfSub = path.join(__dirname, 'datos', 'paraEnviar', 'PDF', 'ejemplo.pdf');
+  const rutaPdf = fs.existsSync(rutaPdfSub)
+    ? rutaPdfSub
+    : path.join(__dirname, 'datos', 'paraEnviar', 'ejemplo.pdf');
+
   if (!fs.existsSync(rutaPdf)) {
-    return responder(ctx, '⚠️ El PDF no se encuentra en el servidor. Revisa la carpeta datos/paraEnviar/');
+    return responder(ctx, '⚠️ El PDF no se encuentra en el servidor. Revisa la carpeta datos/paraEnviar/PDF/');
   }
 
   try {
@@ -343,9 +413,12 @@ bot.action(/^img:(img1|img2|img3)$/, async (ctx) => {
 
   await ctx.answerCbQuery('Enviando imagen...');
 
-  const rutaImg = path.join(__dirname, 'datos', 'paraEnviar', seleccion.archivo);
+  const rutaImgSub = path.join(__dirname, 'datos', 'paraEnviar', 'Imagenes', seleccion.archivo);
+  const rutaImg = fs.existsSync(rutaImgSub)
+    ? rutaImgSub
+    : path.join(__dirname, 'datos', 'paraEnviar', seleccion.archivo);
   if (!fs.existsSync(rutaImg)) {
-    await ctx.editMessageText('⚠️ La imagen no se encuentra en el servidor. Revisa la carpeta datos/paraEnviar/');
+    await ctx.editMessageText('⚠️ La imagen no se encuentra en el servidor. Revisa la carpeta datos/paraEnviar/Imagenes/');
     return;
   }
 
@@ -367,6 +440,190 @@ bot.action(/^img:(img1|img2|img3)$/, async (ctx) => {
   } catch (e) {
     await ctx.editMessageText('Error al enviar la imagen: ' + e.message);
   }
+});
+
+// --- Selección dinámica y envío múltiple de videos -------------------------
+
+const CARPETA_VIDEOS = path.join(__dirname, 'datos', 'paraEnviar', 'Videos');
+const EXTENSIONES_VIDEO = new Set(Object.keys(MIME_VIDEOS));
+const seleccionesVideo = new Map();
+
+function idCortoVideo(nombreArchivo) {
+  return crypto.createHash('sha256').update(nombreArchivo).digest('hex').slice(0, 12);
+}
+
+/** Lee dinámicamente todos los videos válidos dentro de datos/paraEnviar/Videos. */
+function obtenerVideosDisponibles() {
+  if (!fs.existsSync(CARPETA_VIDEOS)) return [];
+  return fs
+    .readdirSync(CARPETA_VIDEOS, { withFileTypes: true })
+    .filter((ent) => ent.isFile() && EXTENSIONES_VIDEO.has(path.extname(ent.name).toLowerCase()))
+    .map((ent) => {
+      const ruta = path.join(CARPETA_VIDEOS, ent.name);
+      const bytes = fs.statSync(ruta).size;
+      return {
+        id: idCortoVideo(ent.name),
+        archivo: ent.name,
+        ruta,
+        mb: (bytes / (1024 * 1024)).toFixed(1),
+      };
+    })
+    .sort((a, b) => a.archivo.localeCompare(b.archivo, 'es', { numeric: true }));
+}
+
+function etiquetaVideo(video, prefijo = '🎬') {
+  const nombre = video.archivo.length > 34 ? `${video.archivo.slice(0, 31)}...` : video.archivo;
+  return `${prefijo} ${nombre} (${video.mb} MB)`;
+}
+
+function construirTecladoVideos(videos, seleccionados = null) {
+  const filas = videos.map((v) => {
+    if (seleccionados) {
+      const marcado = seleccionados.has(v.id);
+      return [Markup.button.callback(etiquetaVideo(v, marcado ? '✅' : '⬜'), `vid:tog:${v.id}`)];
+    }
+    return [Markup.button.callback(etiquetaVideo(v, '🎬'), `vid:one:${v.id}`)];
+  });
+
+  if (seleccionados) {
+    filas.push([
+      Markup.button.callback(`📤 Enviar seleccionados (${seleccionados.size})`, 'vid:send'),
+      Markup.button.callback('❌ Cancelar', 'vid:cancel'),
+    ]);
+  } else if (videos.length > 1) {
+    filas.push([
+      Markup.button.callback('☑️ Seleccionar varios', 'vid:multi'),
+      Markup.button.callback(`📦 Enviar todos (${videos.length})`, 'vid:all'),
+    ]);
+  }
+
+  return Markup.inlineKeyboard(filas);
+}
+
+async function enviarLoteVideos(ctx, listaVideos) {
+  let enviados = 0;
+  for (const video of listaVideos) {
+    if (!fs.existsSync(video.ruta)) {
+      await responder(ctx, `⚠️ El video "${video.archivo}" ya no se encuentra en datos/paraEnviar/Videos/.`);
+      continue;
+    }
+    const ok = await enviarVideoResistente(
+      ctx,
+      video.ruta,
+      video.archivo,
+      `🎬 Video solicitado: ${video.archivo} (${video.mb} MB)`
+    );
+    if (ok) enviados += 1;
+  }
+  return enviados;
+}
+
+bot.command(['video', 'videos'], async (ctx) => {
+  const videos = obtenerVideosDisponibles();
+  if (videos.length === 0) {
+    return responder(
+      ctx,
+      '⚠️ No hay videos en datos/paraEnviar/Videos/. Agrega archivos .mp4, .mov, .mkv, .avi o .webm y vuelve a intentar.'
+    );
+  }
+
+  await ctx.reply(
+    `🎬 ¿Qué video quieres solicitar? (${videos.length} disponible${videos.length === 1 ? '' : 's'})`,
+    construirTecladoVideos(videos, null)
+  );
+});
+
+bot.action(/^vid:(one|tog):([0-9a-f]{12})$/, async (ctx) => {
+  const [, modo, idVideo] = ctx.match;
+  const videos = obtenerVideosDisponibles();
+  const video = videos.find((v) => v.id === idVideo);
+
+  if (!video) {
+    await ctx.answerCbQuery('Video no encontrado.');
+    return ctx.editMessageText('⚠️ El video seleccionado ya no está disponible en datos/paraEnviar/Videos/.');
+  }
+
+  if (modo === 'one') {
+    await ctx.answerCbQuery('Enviando video...');
+    await ctx.editMessageText(`⏳ Enviando video: ${video.archivo} (${video.mb} MB)...`);
+    const ok = await enviarLoteVideos(ctx, [video]);
+    if (ok > 0) {
+      await ctx.editMessageText(`✅ Video enviado: ${video.archivo}`);
+    } else {
+      await ctx.editMessageText(`⚠️ No se pudo completar el envío de ${video.archivo}.`);
+    }
+    return;
+  }
+
+  // Modo selección múltiple (vid:tog:<id>)
+  const llave = `${ctx.chat.id}:${ctx.callbackQuery.message.message_id}`;
+  const setActual = seleccionesVideo.get(llave) || new Set();
+  if (setActual.has(idVideo)) {
+    setActual.delete(idVideo);
+  } else {
+    setActual.add(idVideo);
+  }
+  seleccionesVideo.set(llave, setActual);
+
+  await ctx.answerCbQuery(`${setActual.size} seleccionado(s)`);
+  await ctx.editMessageReplyMarkup(construirTecladoVideos(videos, setActual).reply_markup);
+});
+
+bot.action('vid:multi', async (ctx) => {
+  const videos = obtenerVideosDisponibles();
+  if (videos.length === 0) {
+    return ctx.answerCbQuery('No hay videos disponibles.');
+  }
+  const llave = `${ctx.chat.id}:${ctx.callbackQuery.message.message_id}`;
+  const setActual = new Set();
+  seleccionesVideo.set(llave, setActual);
+
+  await ctx.answerCbQuery('Modo selección múltiple activado');
+  await ctx.editMessageText(
+    '☑️ Toca los videos que quieras incluir y luego pulsa "Enviar seleccionados":',
+    construirTecladoVideos(videos, setActual)
+  );
+});
+
+bot.action('vid:send', async (ctx) => {
+  const llave = `${ctx.chat.id}:${ctx.callbackQuery.message.message_id}`;
+  const setActual = seleccionesVideo.get(llave);
+  if (!setActual || setActual.size === 0) {
+    return ctx.answerCbQuery('Selecciona al menos un video primero.');
+  }
+
+  const videos = obtenerVideosDisponibles();
+  const elegidos = videos.filter((v) => setActual.has(v.id));
+  seleccionesVideo.delete(llave);
+
+  if (elegidos.length === 0) {
+    await ctx.answerCbQuery('Videos no disponibles.');
+    return ctx.editMessageText('⚠️ Ninguno de los videos seleccionados está disponible en el servidor.');
+  }
+
+  await ctx.answerCbQuery(`Enviando ${elegidos.length} video(s)...`);
+  await ctx.editMessageText(`⏳ Enviando ${elegidos.length} video(s) seleccionado(s)...`);
+  const enviados = await enviarLoteVideos(ctx, elegidos);
+  await ctx.editMessageText(`✅ Envío finalizado: ${enviados} de ${elegidos.length} video(s) enviado(s).`);
+});
+
+bot.action('vid:all', async (ctx) => {
+  const videos = obtenerVideosDisponibles();
+  if (videos.length === 0) {
+    return ctx.answerCbQuery('No hay videos disponibles.');
+  }
+
+  await ctx.answerCbQuery(`Enviando ${videos.length} video(s)...`);
+  await ctx.editMessageText(`⏳ Enviando todos los videos (${videos.length})...`);
+  const enviados = await enviarLoteVideos(ctx, videos);
+  await ctx.editMessageText(`✅ Envío finalizado: ${enviados} de ${videos.length} video(s) enviado(s).`);
+});
+
+bot.action('vid:cancel', async (ctx) => {
+  const llave = `${ctx.chat.id}:${ctx.callbackQuery.message.message_id}`;
+  seleccionesVideo.delete(llave);
+  await ctx.answerCbQuery('Cancelado');
+  await ctx.editMessageText('❌ Selección de videos cancelada.');
 });
 
 // --- 5. Documentos e imagenes ----------------------------------------------

@@ -20,7 +20,7 @@ Requisitos: Node.js 18 o mayor, Python 3 y Windows para `calculadora.exe`
 | `/sumar 2 3`, `/multiplicar 4 2.5` | Operan con `python/calculadora.py` |
 | `/exe sumar 7 5` | Invoca `bin/calculadora.exe` |
 | `/calcular 7 5` | Muestra botones: operacion y motor (Python o .exe) |
-| `/pdf`, `/imagen` | Envian los archivos de `datos/paraEnviar/` |
+| `/pdf`, `/imagen`, `/video` | Envian los archivos de `datos/paraEnviar/` (con botones para elegir) |
 | `/id` | Muestra tu id de Telegram |
 
 Tambien puedes enviarle un documento o una foto (maximo 10 MB).

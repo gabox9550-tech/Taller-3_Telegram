@@ -10,6 +10,10 @@ datos/generado/*
 !datos/descargas/.gitkeep
 !datos/generado/.gitkeep
 
+# Videos locales para enviar (no subir archivos de video al repositorio)
+datos/paraEnviar/Videos/*
+!datos/paraEnviar/Videos/.gitkeep
+
 # Basura del sistema
 Thumbs.db
 .DS_Store
